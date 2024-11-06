@@ -6,7 +6,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -18,9 +20,29 @@ import org.slf4j.LoggerFactory;
  * @author Nikolay Perfilov
  */
 public class GrpcChannelPool {
+
+    private class EndpointChannels {
+        private final List<GrpcChannel> channelList;
+        private final AtomicInteger roundRobinIndex = new AtomicInteger(0);
+        private final int channelCountPerEndpoint = 4;
+
+        EndpointChannels(EndpointRecord endpoint) {
+            this.channelList = new CopyOnWriteArrayList<>();
+
+            for (int i = 0; i < channelCountPerEndpoint; i++) {
+                channelList.add(new GrpcChannel(endpoint, channelFactory));
+            }
+        }
+
+        public GrpcChannel getNextChannel() {
+            int index = roundRobinIndex.getAndUpdate(i -> (i + 1) % channelList.size());
+            return channelList.get(index);
+        }
+    }
+
     private static final Logger logger = LoggerFactory.getLogger(GrpcChannelPool.class);
 
-    private final Map<String, GrpcChannel> channels = new ConcurrentHashMap<>();
+    private final Map<String, EndpointChannels> channels = new ConcurrentHashMap<>();
     private final ManagedChannelFactory channelFactory;
     private final ScheduledExecutorService executor;
 
@@ -32,12 +54,13 @@ public class GrpcChannelPool {
     public GrpcChannel getChannel(EndpointRecord endpoint) {
         // Workaround for https://bugs.openjdk.java.net/browse/JDK-8161372 to prevent unnecessary locks in Java 8
         // Was fixed in Java 9+
-        GrpcChannel result = channels.get(endpoint.getHostAndPort());
 
-        return result != null ? result : channels.computeIfAbsent(endpoint.getHostAndPort(), (key) -> {
-            logger.debug("channel " + endpoint.getHostAndPort() + " was not found in pool, creating one...");
-            return new GrpcChannel(endpoint, channelFactory);
+        EndpointChannels endpointChannels = channels.computeIfAbsent(endpoint.getHostAndPort(), key -> {
+            logger.debug("Channels for " + endpoint.getHostAndPort() + " were not found in pool, creating...");
+            return new EndpointChannels(endpoint);
         });
+
+        return endpointChannels.getNextChannel();
     }
 
     private CompletableFuture<Boolean> shutdownChannels(Collection<GrpcChannel> channelsToShutdown) {
@@ -66,28 +89,45 @@ public class GrpcChannelPool {
         }
 
         logger.debug("removing {} endpoints from pool: {}", endpointsToRemove.size(), endpointsToRemove);
+
         List<GrpcChannel> channelsToShutdown = endpointsToRemove.stream()
                 .map(EndpointRecord::getHostAndPort)
                 .map(channels::remove)
                 .filter(Objects::nonNull)
+                .flatMap(endpointChannels -> endpointChannels.channelList.stream())
                 .collect(Collectors.toList());
 
         return shutdownChannels(channelsToShutdown);
     }
 
     public CompletableFuture<Boolean> shutdown() {
-        logger.debug("initiating grpc pool shutdown with {} channels...", channels.size());
-        return shutdownChannels(channels.values()).whenComplete((res, th) -> {
-            if (res != null && res) {
-                logger.debug("grpc pool was shutdown successfully");
+        logger.debug("Initiating gRPC pool shutdown with {} endpoints...", channels.size());
+
+        // Collect all GrpcChannel instances from each EndpointChannels
+        List<GrpcChannel> channelsToShutdown = channels.values().stream()
+                .flatMap(endpointChannels -> endpointChannels.channelList.stream()) // Flatten all GrpcChannel instances
+                .collect(Collectors.toList());
+
+        // Initiate shutdown for all collected channels
+        return shutdownChannels(channelsToShutdown).whenComplete((res, th) -> {
+            if (th != null) {
+                logger.warn("An error occurred during the gRPC pool shutdown", th);
+            } else if (res != null && res) {
+                logger.debug("gRPC pool was shut down successfully");
             } else {
-                logger.warn("grpc pool was not shutdown properly");
+                logger.warn("gRPC pool was not shut down properly");
             }
         });
     }
 
+    // TODO: not sure, here I try to return only single channel for each endpoint
+    // to keep tests green. I.e. "backward compatibility"
     @VisibleForTesting
     Map<String, GrpcChannel> getChannels() {
-        return channels;
+        return channels.entrySet().stream()
+            .collect(Collectors.toMap(
+                Map.Entry::getKey,
+                entry -> entry.getValue().channelList.get(0)
+            ));
     }
 }
